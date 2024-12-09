@@ -1,183 +1,157 @@
-﻿using ApiGamesLog;
-using HtmlAgilityPack;
+﻿using OpenQA.Selenium;
+using OpenQA.Selenium.Chrome;
+using System;
 using System.Collections.Generic;
 using System.Data.SqlClient;
-using System.Net.Http;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
-using System;
 using Dapper;
+using System.Net.Http;
 
-public class MetacriticScraper
+namespace ApiGamesLog
 {
-    private static readonly HttpClient client = new HttpClient();
-    private const string ConnectionString = "Data Source=85.208.21.117,54321;" +
-                "Initial Catalog=BBDDGamesLog;" +
-                "User ID=sa;" +
-                "Password=Sql#123456789;" +
-                "TrustServerCertificate=True;"; // Reemplaza con tu cadena de conexión a la base de datos
-
-    public static async Task ScrapeAndSaveAllPagesAsync(string baseUrl, int totalPages)
+    public class MetacriticScraper
     {
-        int currentPage = 1;
-        int gamesOnPage = 0;
+        private const string ConnectionString = "Data Source=85.208.21.117,54321;" +
+                    "Initial Catalog=BBDDGamesLog;" +
+                    "User ID=sa;" +
+                    "Password=Sql#123456789;" +
+                    "TrustServerCertificate=True;"; // Reemplaza con tu cadena de conexión a la base de datos
 
-        while (currentPage <= totalPages)  // Empezamos desde la página 1
+        public static async Task ScrapeAndSaveAllPagesAsync(string baseUrl, int totalPages)
         {
-            var url = $"{baseUrl}&page={currentPage}"; // Reemplazamos el número de página en la URL
-            Console.WriteLine($"Scraping page {currentPage} of {totalPages} - URL: {url}");
-            gamesOnPage = await ScrapeAndSaveGamesAsync(url);
+            var tasks = new List<Task>();
 
-            // Si llegamos a 24 juegos, pasamos a la siguiente página
-            if (gamesOnPage == 24)
+            // Utilizamos Parallel.ForEach para procesar múltiples páginas al mismo tiempo
+            Parallel.For(1, totalPages + 1, (currentPage) =>
             {
-                currentPage++;
-            }
-            else
-            {
-                // Si no se obtienen 24 juegos, hemos llegado al final de las páginas disponibles
-                break;
-            }
+                tasks.Add(Task.Run(async () =>
+                {
+                    var url = $"{baseUrl}&page={currentPage}";
+                    Console.WriteLine($"Scraping page {currentPage} of {totalPages} - URL: {url}");
+                    await ScrapeAndSaveGamesAsync(url);
+                }));
+            });
+
+            await Task.WhenAll(tasks);
         }
-    }
 
-    public static async Task<int> ScrapeAndSaveGamesAsync(string url)
-    {
-        try
+        public static async Task ScrapeAndSaveGamesAsync(string url)
         {
-            var response = await client.GetStringAsync(url);
-
-            if (string.IsNullOrEmpty(response))
+            try
             {
-                // Si no se pudo obtener el contenido, devolver 0 y no guardar ningún juego
-                Console.WriteLine($"No se pudo obtener contenido de la URL: {url}");
-                return 0;
-            }
+                var options = new ChromeOptions();
+                options.AddArgument("--headless"); // Ejecutar Chrome en modo headless
+                options.AddArgument("--disable-gpu"); // Necesario para algunos entornos de ejecución
+                options.AddArgument("--no-sandbox");
 
-            var htmlDocument = new HtmlDocument();
-            htmlDocument.LoadHtml(response);
-
-            var games = new List<Game>();
-
-            var gameNodes = htmlDocument.DocumentNode.SelectNodes("//div[contains(@class, 'c-finderProductCard c-finderProductCard-game')]");
-
-            if (gameNodes == null)
-            {
-                Console.WriteLine("No se encontraron nodos de juegos en la página.");
-                return 0;
-            }
-
-            foreach (var gameNode in gameNodes)
-            {
-                var titleNode = gameNode.SelectSingleNode(".//h3[contains(@class, 'c-finderProductCard_titleHeading')]/span[2]");
-                var descriptionNode = gameNode.SelectSingleNode(".//div[contains(@class, 'c-finderProductCard_description')]/span[1]");
-                var scoreNode = gameNode.SelectSingleNode(".//div[contains(@class, 'c-siteReviewScore u-flexbox-column u-flexbox-alignCenter u-flexbox-justifyCenter g-text-bold c-siteReviewScore_green g-color-gray90 c-siteReviewScore_xsmall')]/span");
-                var releaseDateNode = gameNode.SelectSingleNode(".//span[contains(@class, 'u-text-uppercase')]");
-
-                if (titleNode == null || descriptionNode == null || scoreNode == null || releaseDateNode == null)
+                using (var driver = new ChromeDriver(options))
                 {
-                    Console.WriteLine("Faltan datos en un nodo del juego. Continuando con el siguiente.");
-                    continue;
-                }
+                    driver.Navigate().GoToUrl(url);
+                    // Esperar a que se cargue la página
+                    await Task.Delay(5000); // Espera 5 segundos para que se carguen los elementos dinámicos
 
-                var title = titleNode.InnerText.Trim();
-                var gameDescription = descriptionNode.InnerText.Trim();
-                var metacriticScore = int.Parse(scoreNode.InnerText.Trim());
-                var releaseDate = DateTime.Parse(releaseDateNode.InnerText.Trim());
-                var coverImageNode = gameNode.SelectSingleNode(".//div[contains(@class, 'c-finderProductCard_img')]/picture//img");
-                var coverImageUrl = coverImageNode?.GetAttributeValue("src", "");
+                    var games = new List<Game>();
 
-                byte[] coverImageBytes = null;
+                    var gameNodes = driver.FindElements(By.XPath("//div[contains(@class, 'c-finderProductCard c-finderProductCard-game')]"));
 
-                if (coverImageUrl != null)
-                {
-                    // Intentamos descargar la imagen solo si la URL no es null
-                    coverImageBytes = await DownloadImageAsync(coverImageUrl);
-                    if (coverImageBytes == null)
+                    if (gameNodes.Count == 0)
                     {
-                        Console.WriteLine("No se pudo descargar la imagen del juego, se guardará como null.");
+                        Console.WriteLine("No se encontraron nodos de juegos en la página.");
+                        return;
                     }
-                }
 
-                // Agregar el juego a la lista, incluso si coverImageBytes es null
-                games.Add(new Game
-                {
-                    Title = title,
-                    GameDescription = gameDescription,
-                    MetacriticScore = metacriticScore,
-                    CoverImage = coverImageBytes,  // Guardamos null si no se descargó la imagen
-                    ReleaseDate = releaseDate,
-                });
-            }
-
-            // Guardar los juegos en la base de datos después de procesar todos
-            SaveGamesToDatabase(games);
-
-            return games.Count;  // Devuelve el número de juegos encontrados en esta página
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error al procesar la URL: {url} - {ex.Message}");
-            return 0;
-        }
-    }
-
-
-    private static async Task<byte[]> DownloadImageAsync(string imageUrl)
-    {
-        try
-        {
-            // Verifica si la URL es relativa (comienza con '/')
-            if (!Uri.IsWellFormedUriString(imageUrl, UriKind.Absolute))
-            {
-                // Concatenar la URL base con la URL relativa
-                var baseUrl = "https://www.metacritic.com";  // URL base adecuada
-                imageUrl = baseUrl + imageUrl;
-            }
-
-            var requestMessage = new HttpRequestMessage(HttpMethod.Get, imageUrl);
-            requestMessage.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
-
-            var response = await client.SendAsync(requestMessage);
-
-            // Verificar si la respuesta es exitosa
-            if (response.IsSuccessStatusCode)
-            {
-                return await response.Content.ReadAsByteArrayAsync();
-            }
-            else
-            {
-                // Si no se pudo descargar la imagen, se retorna null
-                Console.WriteLine($"Error al descargar la imagen. Estado HTTP: {response.StatusCode}");
-                return null;
-            }
-        }
-        catch (Exception ex)
-        {
-            // Loguear el error y devolver null, sin interrumpir la ejecución
-            Console.WriteLine($"Error al descargar la imagen: {ex.Message}");
-            return null;
-        }
-    }
-
-
-    private static void SaveGamesToDatabase(List<Game> games)
-    {
-        using (var connection = new SqlConnection(ConnectionString))
-        {
-            connection.Open();
-
-            foreach (var game in games)
-            {
-                connection.Execute(
-                    "INSERT INTO Game (Title, GameDescription, MetacriticScore, CoverImage, ReleaseDate) VALUES (@Title, @GameDescription, @MetacriticScore, @CoverImage, @ReleaseDate)",
-                    new
+                    foreach (var gameNode in gameNodes)
                     {
-                        game.Title,
-                        game.GameDescription,
-                        game.MetacriticScore,
-                        game.CoverImage,
-                        game.ReleaseDate,
-                    });
+                        var titleNode = gameNode.FindElement(By.XPath(".//h3[contains(@class, 'c-finderProductCard_titleHeading')]/span[2]"));
+                        var descriptionNode = gameNode.FindElement(By.XPath(".//div[contains(@class, 'c-finderProductCard_description')]/span[1]"));
+                        var scoreNode = gameNode.FindElement(By.XPath(".//div[contains(@class, 'c-siteReviewScore u-flexbox-column u-flexbox-alignCenter u-flexbox-justifyCenter g-text-bold c-siteReviewScore_green g-color-gray90 c-siteReviewScore_xsmall')]/span"));
+                        var releaseDateNode = gameNode.FindElement(By.XPath(".//span[contains(@class, 'u-text-uppercase')]"));
+                        var coverImageNode = gameNode.FindElement(By.XPath(".//div[contains(@class, 'c-finderProductCard_img')]/picture//img"));
+
+                        if (titleNode == null || descriptionNode == null || scoreNode == null || releaseDateNode == null || coverImageNode == null)
+                        {
+                            Console.WriteLine("Faltan datos en un nodo del juego. Continuando con el siguiente.");
+                            continue;
+                        }
+
+                        var title = titleNode.Text.Trim();
+                        var gameDescription = descriptionNode.Text.Trim();
+                        var metacriticScore = int.Parse(scoreNode.Text.Trim());
+                        var releaseDate = DateTime.Parse(releaseDateNode.Text.Trim());
+                        var coverImageUrl = coverImageNode.GetAttribute("src");
+
+                        if (string.IsNullOrEmpty(coverImageUrl))
+                        {
+                            Console.WriteLine("No se pudo obtener la URL de la imagen del juego, no se guardará el juego.");
+                            continue;
+                        }
+
+                        byte[] coverImageBytes = await DownloadImageAsync(coverImageUrl);
+                        if (coverImageBytes == null)
+                        {
+                            Console.WriteLine("No se pudo descargar la imagen del juego, no se guardará el juego.");
+                            continue;
+                        }
+
+                        games.Add(new Game
+                        {
+                            Title = title,
+                            GameDescription = gameDescription,
+                            MetacriticScore = metacriticScore,
+                            CoverImage = coverImageBytes,
+                            ReleaseDate = releaseDate,
+                        });
+                    }
+
+                    // Guardar los juegos en la base de datos después de procesar todos
+                    SaveGamesToDatabase(games);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error al procesar la URL: {url} - {ex.Message}");
+            }
+        }
+
+        private static async Task<byte[]> DownloadImageAsync(string imageUrl)
+        {
+            using (var client = new HttpClient())
+            {
+                try
+                {
+                    var response = await client.GetAsync(imageUrl);
+                    response.EnsureSuccessStatusCode();
+                    return await response.Content.ReadAsByteArrayAsync();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error al descargar la imagen: {ex.Message}");
+                    return null;
+                }
+            }
+        }
+
+        private static void SaveGamesToDatabase(List<Game> games)
+        {
+            using (var connection = new SqlConnection(ConnectionString))
+            {
+                connection.Open();
+
+                foreach (var game in games)
+                {
+                    connection.Execute(
+                        "INSERT INTO Game (Title, GameDescription, MetacriticScore, CoverImage, ReleaseDate) VALUES (@Title, @GameDescription, @MetacriticScore, @CoverImage, @ReleaseDate)",
+                        new
+                        {
+                            game.Title,
+                            game.GameDescription,
+                            game.MetacriticScore,
+                            game.CoverImage,
+                            game.ReleaseDate,
+                        });
+                }
             }
         }
     }
